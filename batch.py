@@ -1,5 +1,5 @@
 """
-Stream an OCT spectral cube to a multi-page TIFF while showing a live preview.
+Stream an OCT spectral cube to a multipage TIFF while showing a live preview.
 Exactly the same reconstruction maths as before—only the writer changed.
 """
 from __future__ import annotations
@@ -13,7 +13,6 @@ import tifffile                              # pip install tifffile
 from scipy.fft import fft, fftshift
 from scipy.interpolate import PchipInterpolator
 import scipy.io
-import scipy.optimize as opt                 # kept to mirror earlier import set
 from scipy.signal import butter, filtfilt, windows
 
 # ──────────────────────────────────────────────────────────────────────────────
