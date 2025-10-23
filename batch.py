@@ -1,6 +1,5 @@
 """
 Stream an OCT spectral cube to a multipage TIFF while showing a live preview.
-Exactly the same reconstruction maths as before—only the writer changed.
 """
 from __future__ import annotations
 
@@ -90,22 +89,43 @@ def read_cube(path: str | Path, k: int, a: int) -> Tuple[np.ndarray, int]:
 # Frame processing
 # ──────────────────────────────────────────────────────────────────────────────
 def process(fringe: np.ndarray, wl: np.ndarray) -> np.ndarray:
-    flin = linear_freq_grid(wl)
-    f = 3.0e8 / wl
+    """
+    Reconstruct one B-scan magnitude (log-scaled) with consistent math.
+    Fixes: FFT sizing/cropping tied to spectral length; DC along k-axis;
+    dispersion/window length tied to resampled grid; correct op order.
+    """
+    # 1) Build k-linear grid (length M)
+    flin = linear_freq_grid(wl)                   # shape (M,)
+    c0 = 3.0e8
+    f_raw = c0 / wl
+    if f_raw[0] > f_raw[-1]:
+        f_raw = f_raw[::-1]
+        fringe = fringe[::-1, :]                  # keep (k, a) aligned
 
-    dc = filtfilt(*butter(BUTTER_N, BUTTER_CUTOFF, btype="low"),
-                  fringe.mean(1), axis=0)
-    fr = fringe - dc[:, None]
-    if f[0] > f[-1]:
-        f, fr = f[::-1], fr[::-1, :]
+    # 2) DC removal per spectrum (along k)
+    # Do NOT average across A-scans and filter that; subtract per-k mean directly.
+    fr = fringe - np.mean(fringe, axis=1, keepdims=True)
 
-    fr = PchipInterpolator(f, fr, axis=0)(flin)
+    # 3) Resample to linear k with PCHIP (vectorized over A-scans)
+    fr = PchipInterpolator(f_raw, fr, axis=0)(flin)  # shape (M, A)
+
+    # 4) Cast up to complex128 (phase-sensitive steps ahead)
     fr = fr.astype(np.complex128, copy=False)
-    fr *= dispersion_kernel(NUM_K, C2A, C3A)[:, None]
-    fr *= gaussian_window(NUM_K, GAUSS_STD_ALPHA)[:, None]
 
-    mag = fftshift(np.abs(fft(fr, 2 * 941, axis=0, workers=-1)), 0)[941:, :]
+    # 5) Match kernel/window lengths to resampled grid (M), not NUM_K blindly
+    M = fr.shape[0]
+    fr *= dispersion_kernel(M, C2A, C3A)[:, None]
+    fr *= gaussian_window(M, GAUSS_STD_ALPHA)[:, None]
+
+    # 6) FFT with *consistent* zero-padding and center/crop using M
+    depth_fft = fft(fr, 2 * M, axis=0, workers=-1)   # size 2M along depth
+    depth_fft = fftshift(depth_fft, axes=0)
+    half = M                                        # crop positive depths
+    mag = np.abs(depth_fft[half:, :])
+
+    # 7) Log compression
     return np.log10(np.maximum(mag, 1e-12)).astype(np.float32)
+
 
 def apply_dao_to_volume(volume_complex: np.ndarray,
                         patch_size: int = 256,
