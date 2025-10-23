@@ -14,7 +14,6 @@ import numpy as np
 import scipy.io
 from scipy.fft import fft, fftshift
 from scipy.interpolate import PchipInterpolator
-import scipy.optimize as opt  # kept to preserve original import set
 from scipy.signal import butter, filtfilt, windows
 
 # -----------------------------------------------------------------------------
@@ -166,28 +165,6 @@ def main() -> None:
 
     print(f"Loaded frame {FRAME_IDX} of {n_frames} from {RAW_FILE}")
     log_img = process_single_frame(cube[:, :, FRAME_IDX], wavelength)
-    
-    freq = 3e8 / wavelength
-    freq_lin, _ = build_linear_freq_grids(wavelength)
-    plt.figure()
-    plt.plot(freq, label="Original Frequency")
-    plt.plot(freq_lin, label="Linearized Frequency")
-    plt.title("Frequency Resampling")
-    plt.xlabel("Index")
-    plt.ylabel("Frequency (Hz)")
-    plt.legend()
-    plt.tight_layout()
-    plt.show()
-
-    kernel = dispersion_kernel(NUM_K, C2A, C3A)
-    plt.figure()
-    plt.plot(np.angle(kernel))
-    plt.title("Dispersion Kernel Phase Profile")
-    plt.xlabel("Pixel Index")
-    plt.ylabel("Phase (radians)")
-    plt.tight_layout()
-    plt.show()
-
 
     plt.figure()
     plt.plot(cube[:, 1000, FRAME_IDX])

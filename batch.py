@@ -15,6 +15,8 @@ from scipy.interpolate import PchipInterpolator
 import scipy.io
 from scipy.signal import butter, filtfilt, windows
 
+from DAO import dls_dao_refocus
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Configuration
 # ──────────────────────────────────────────────────────────────────────────────
@@ -105,42 +107,153 @@ def process(fringe: np.ndarray, wl: np.ndarray) -> np.ndarray:
     mag = fftshift(np.abs(fft(fr, 2 * 941, axis=0, workers=-1)), 0)[941:, :]
     return np.log10(np.maximum(mag, 1e-12)).astype(np.float32)
 
+def apply_dao_to_volume(volume_complex: np.ndarray,
+                        patch_size: int = 256,
+                        depth_index: int | None = None,
+                        visualize: bool = True):
+    """
+    Apply digital adaptive optics (DAO) to a 3-D OCT complex volume.
+
+    Parameters
+    ----------
+    volume_complex : ndarray
+        Complex-valued OCT volume, shape (depth, x, y).
+    patch_size : int
+        Size of square patch (in pixels) for DAO estimation.
+    depth_index : int or None
+        Depth index to select for en-face DAO patch.
+        If None, use the layer with maximum total intensity.
+    visualize : bool
+        If True, show before/after PSF comparison.
+
+    Returns
+    -------
+    volume_corrected : ndarray
+        Phase-corrected complex volume, same shape as input.
+    dao_result : dict
+        Full dictionary from `dls_dao_refocus`, including
+        WFE map, Zernike coefficients, and refocused PSF.
+    """
+
+    if volume_complex.ndim != 3:
+        raise ValueError("volume_complex must have shape (depth, x, y)")
+
+    depth, nx, ny = volume_complex.shape
+
+    # 1. Choose depth slice
+    if depth_index is None:
+        intensity_profile = np.sum(np.abs(volume_complex)**2, axis=(1, 2))
+        depth_index = int(np.argmax(intensity_profile))
+    enface_complex = volume_complex[depth_index]
+
+    # 2. Extract centered square patch
+    cx, cy = nx // 2, ny // 2
+    half = patch_size // 2
+    psf_patch = enface_complex[cx - half:cx + half, cy - half:cy + half]
+
+    if psf_patch.shape[0] < patch_size or psf_patch.shape[1] < patch_size:
+        raise ValueError("Patch size too large for the input volume dimensions.")
+
+    # 3. Run DAO
+    dao_result = dls_dao_refocus(psf_patch, pupil_radius_pix=patch_size // 2)
+    wfe = dao_result["WFE_rad"]
+
+    # 4. Apply phase correction to full volume
+    # Extend WFE map to match (x,y) dimensions by tiling
+    corr_map = np.exp(-1j * wfe)
+    if wfe.shape != (nx, ny):
+        corr_map = np.pad(corr_map,
+                          (((nx - wfe.shape[0]) // 2, (nx - wfe.shape[0] + 1) // 2),
+                           ((ny - wfe.shape[1]) // 2, (ny - wfe.shape[1] + 1) // 2)),
+                          mode='edge')
+        corr_map = corr_map[:nx, :ny]
+
+    volume_corrected = volume_complex * corr_map
+
+    # 5. Optional visualization
+    if visualize:
+        plt.figure(figsize=(10, 4))
+        plt.subplot(1, 2, 1)
+        plt.title(f"Original en-face (z={depth_index})")
+        plt.imshow(np.abs(enface_complex), cmap="gray")
+        plt.axis("off")
+        plt.subplot(1, 2, 2)
+        plt.title("DAO-corrected patch")
+        plt.imshow(np.abs(dao_result["psf_refocused"]), cmap="gray")
+        plt.axis("off")
+        plt.tight_layout()
+        plt.show()
+
+    return volume_corrected, dao_result
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Main volume loop + live preview
 # ──────────────────────────────────────────────────────────────────────────────
 def main() -> None:
-    wl   = load_wavelength(LAMBDA_CAL_FILE)
-    cube, n = read_cube(RAW_FILE, NUM_K, NUM_A)
+    wl, (cube, n) = load_wavelength(LAMBDA_CAL_FILE), read_cube(RAW_FILE, NUM_K, NUM_A)
     print(f"Processing {n} frames …")
+
+    # Pre-allocate in half precision (≈3 GB instead of 6 GB)
+    volume_complex = np.memmap("volume_complex.dat",
+                               dtype=np.complex64, mode="w+",
+                               shape=(941, NUM_A, n))
 
     plt.ion()
     fig, ax = plt.subplots(figsize=(8, 5))
-    im = ax.imshow(np.zeros((941, NUM_A), np.float32), cmap="gray",
-                   vmin=LOG_RANGE[0], vmax=LOG_RANGE[1],
+    im = ax.imshow(np.zeros((941, NUM_A), np.float32),
+                   cmap="gray", vmin=LOG_RANGE[0], vmax=LOG_RANGE[1],
                    origin="upper", aspect="auto")
     ax.set_xlabel("A-scan index")
     ax.set_ylabel("Depth (pixels)")
-    fig.canvas.manager.set_window_title("OCT volume processing")
+    fig.canvas.manager.set_window_title("OCT + DAO stream")
 
-    # High-level helper—one call per slice, append=True streams into one file
+    # ─── stream frames ───────────────────────────────────────────────
     for idx in range(n):
-        slice_img = process(cube[:, :, idx], wl)
+        flin = linear_freq_grid(wl)
+        f = 3.0e8 / wl
+        dc = filtfilt(*butter(BUTTER_N, BUTTER_CUTOFF, btype="low"),
+                      cube[:, :, idx].mean(1), axis=0)
+        fr = cube[:, :, idx] - dc[:, None]
+        if f[0] > f[-1]:
+            f, fr = f[::-1], fr[::-1, :]
+        fr = PchipInterpolator(f, fr, axis=0)(flin)
+        fr = fr.astype(np.complex64, copy=False)
+        fr *= dispersion_kernel(NUM_K, C2A, C3A).astype(np.complex64)[:, None]
+        fr *= gaussian_window(NUM_K, GAUSS_STD_ALPHA)[:, None]
+        bscan = fftshift(fft(fr, 2 * 941, axis=0), 0)[941:, :].astype(np.complex64)
+        volume_complex[:, :, idx] = bscan  # save complex slice on disk
 
-        tifffile.imwrite(
-            OUTPUT_TIFF,
-            slice_img,
-            photometric="minisblack",
-            append=True,
-            metadata=None,          # avoids ImageJ metadata bloat
-        )
+        mag = np.log10(np.maximum(np.abs(bscan), 1e-12)).astype(np.float32)
+        tifffile.imwrite(OUTPUT_TIFF, mag, append=True,
+                         photometric="minisblack", metadata=None)
 
-        im.set_data(slice_img)
-        ax.set_title(f"Frame {idx + 1} / {n}")
-        fig.canvas.draw_idle()
-        fig.canvas.flush_events()
+        im.set_data(mag)
+        ax.set_title(f"Frame {idx+1}/{n}")
+        fig.canvas.draw_idle(); fig.canvas.flush_events()
 
     plt.ioff()
-    print(f"Done. Stack saved to: {OUTPUT_TIFF.resolve()}")
+    print("Streaming done — running DAO correction …")
+
+    # ─── DAO phase correction on disk-mapped volume ─────────────────────────
+    volume_complex.flush()                      # ensure data written
+    volume_mm = np.memmap("volume_complex.dat", dtype=np.complex64,
+                          mode="r", shape=(941, NUM_A, n))
+
+    volume_corrected, dao_result = apply_dao_to_volume(volume_mm,
+                                                       patch_size=256,
+                                                       depth_index=None,
+                                                       visualize=True)
+
+    # write corrected version
+    OUTPUT_DAO = OUTPUT_TIFF.with_stem(OUTPUT_TIFF.stem + "_DAO")
+    for idx in range(n):
+        mag_corr = np.log10(np.maximum(np.abs(volume_corrected[:, :, idx]), 1e-12)).astype(np.float32)
+        tifffile.imwrite(OUTPUT_DAO, mag_corr, append=True,
+                         photometric="minisblack", metadata=None)
+
+    print(f"Uncorrected → {OUTPUT_TIFF.resolve()}")
+    print(f"DAO-corrected → {OUTPUT_DAO.resolve()}")
+
 
 if __name__ == "__main__":
     main()
